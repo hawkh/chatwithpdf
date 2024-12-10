@@ -11,7 +11,7 @@ This Streamlit application allows users to upload PDF files and ask questions ab
 
 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/pdf-chat-app.git
+git clone https://github.com/hawkh/chatwithpdf.git
 cd pdf-chat-app
 ```
 
