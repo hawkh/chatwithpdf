@@ -48,6 +48,6 @@ streamlit run main.py
 
 ## 🤝 Contributing
 
--Contributions are welcome! Please check the outstanding issues and feel free to open a pull request.
+- Contributions are welcome! Please check the outstanding issues and feel free to open a pull request.
 
 
