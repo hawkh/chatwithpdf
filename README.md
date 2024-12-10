@@ -45,3 +45,9 @@ streamlit run main.py
 ## Notes
 - Ensure you have a stable internet connection
 - Large PDFs may take longer to process
+
+  ## 🤝 Contributing
+
+Contributions are welcome! Please check the outstanding issues and feel free to open a pull request.
+
+
