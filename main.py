@@ -4,7 +4,6 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import google.generativeai as genai
-from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
@@ -12,6 +11,14 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Configuration from environment
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+VECTOR_DB = os.getenv("VECTOR_DB", "CHROMA").upper()
+PERSIST_DIR = os.getenv("PERSIST_DIR", "chroma_db")
+TOP_K = int(os.getenv("TOP_K", "5"))
+
 
 def get_pdf_text(pdf_docs):
     """Extract text from uploaded PDF files."""
@@ -22,17 +29,50 @@ def get_pdf_text(pdf_docs):
             text += page.extract_text()
     return text
 
+
 def get_text_chunks(text):
     """Split text into manageable chunks."""
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     chunks = text_splitter.split_text(text)
     return chunks
 
-def get_vector_store(text_chunks):
-    """Create and save vector store from text chunks."""
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index")
+
+def get_embeddings():
+    return GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+
+def build_or_update_vector_store(text_chunks):
+    """Create or update vector store from text chunks with persistence."""
+    embeddings = get_embeddings()
+    if VECTOR_DB == "CHROMA":
+        from langchain_community.vectorstores import Chroma
+        vs = Chroma.from_texts(
+            texts=text_chunks,
+            embedding=embeddings,
+            collection_name="pdf_chunks",
+            persist_directory=PERSIST_DIR,
+        )
+        vs.persist()
+    else:
+        from langchain_community.vectorstores import FAISS
+        index_dir = "faiss_index"
+        if os.path.exists(index_dir):
+            vs = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
+            vs.add_texts(text_chunks)
+            vs.save_local(index_dir)
+        else:
+            vs = FAISS.from_texts(text_chunks, embedding=embeddings)
+            vs.save_local(index_dir)
+
+
+def load_vector_store():
+    embeddings = get_embeddings()
+    if VECTOR_DB == "CHROMA":
+        from langchain_community.vectorstores import Chroma
+        return Chroma(collection_name="pdf_chunks", persist_directory=PERSIST_DIR, embedding_function=embeddings)
+    from langchain_community.vectorstores import FAISS
+    return FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+
 
 def get_conversational_chain():
     """Create conversational chain for question answering."""
@@ -50,25 +90,26 @@ def get_conversational_chain():
     chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
     return chain
 
+
 def user_input(user_question):
     """Process user question against uploaded PDF context."""
     try:
-        # Verify embeddings and vector store
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-        
-        # Perform similarity search
-        docs = new_db.similarity_search(user_question)
-        
+        # Load vector store according to backend
+        new_db = load_vector_store()
+
+        # Perform similarity search via retriever
+        retriever = new_db.as_retriever(search_kwargs={"k": TOP_K})
+        docs = retriever.get_relevant_documents(user_question)
+
         # Get conversational chain
         chain = get_conversational_chain()
-        
+
         # Get response
         response = chain(
             {"input_documents": docs, "question": user_question}, 
             return_only_outputs=True
         )
-        
+
         # Display response
         st.write("Reply: ", response["output_text"])
     
@@ -76,10 +117,12 @@ def user_input(user_question):
         st.error(f"An error occurred: {str(e)}")
         st.error("Please upload PDFs and process them first.")
 
+
 def main():
     """Main Streamlit application."""
     st.set_page_config("Chat PDF", page_icon="📄")
     st.header("Chat with PDF using Gemini 💁")
+    st.caption(f"Vector DB backend: {VECTOR_DB}")
 
     # Sidebar for PDF upload
     with st.sidebar:
@@ -97,8 +140,8 @@ def main():
                     # Create text chunks
                     text_chunks = get_text_chunks(raw_text)
                     
-                    # Create vector store
-                    get_vector_store(text_chunks)
+                    # Create or update vector store
+                    build_or_update_vector_store(text_chunks)
                     
                     st.success("PDFs processed successfully!")
             else:
