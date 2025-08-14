@@ -4,7 +4,6 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import google.generativeai as genai
-from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
@@ -25,6 +24,13 @@ if not api_key:
     st.stop()
 genai.configure(api_key=api_key)
 
+# Config
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+VECTOR_DB = os.getenv("VECTOR_DB", "CHROMA").upper()
+PERSIST_DIR = os.getenv("PERSIST_DIR", "chroma_db")
+TOP_K = int(os.getenv("TOP_K", "5"))
+
 # Function to extract text from PDFs
 def get_pdf_text(pdf_docs):
     """Extract text from uploaded PDF files."""
@@ -44,7 +50,7 @@ def get_pdf_text(pdf_docs):
 def get_text_chunks(text):
     """Split text into chunks for processing."""
     try:
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
         chunks = text_splitter.split_text(text)
         logger.info(f"Text split into {len(chunks)} chunks")
         return chunks
@@ -54,13 +60,36 @@ def get_text_chunks(text):
         return []
 
 # Function to create and save vector store
+def get_embeddings():
+    return GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+
 def get_vector_store(text_chunks):
-    """Create and save a FAISS vector store from text chunks."""
+    """Create and save a vector store (Chroma or FAISS) from text chunks."""
     try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-        vector_store.save_local("faiss_index")
-        logger.info("Vector store created and saved successfully")
+        embeddings = get_embeddings()
+        if VECTOR_DB == "CHROMA":
+            from langchain_community.vectorstores import Chroma
+            vs = Chroma.from_texts(
+                texts=text_chunks,
+                embedding=embeddings,
+                collection_name="pdf_chunks",
+                persist_directory=PERSIST_DIR,
+            )
+            vs.persist()
+            logger.info("Chroma vector store created/updated and persisted successfully")
+        else:
+            from langchain_community.vectorstores import FAISS
+            vector_store = None
+            index_dir = "faiss_index"
+            if os.path.exists(index_dir):
+                vector_store = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
+                vector_store.add_texts(text_chunks)
+                vector_store.save_local(index_dir)
+            else:
+                vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+                vector_store.save_local(index_dir)
+            logger.info("FAISS vector store created/updated and saved successfully")
     except Exception as e:
         logger.error(f"Error creating vector store: {e}")
         st.error(f"Error creating vector store: {e}")
@@ -73,7 +102,6 @@ def get_conversational_chain():
     state "answer is not available in the context". Do not provide incorrect answers.\n\n
     Context:\n {context}\n
     Question: \n{question}\n
-
     Answer:
     """
     try:
@@ -87,28 +115,40 @@ def get_conversational_chain():
         st.error(f"Error initializing conversational chain: {e}")
         return None
 
+
+def load_vector_store():
+    embeddings = get_embeddings()
+    if VECTOR_DB == "CHROMA":
+        from langchain_community.vectorstores import Chroma
+        return Chroma(collection_name="pdf_chunks", persist_directory=PERSIST_DIR, embedding_function=embeddings)
+    from langchain_community.vectorstores import FAISS
+    return FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+
 # Function to handle user input and generate responses
 def user_input(user_question):
     """Process user question and generate a response."""
     try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-        docs = new_db.similarity_search(user_question)
+        new_db = load_vector_store()
+        retriever = new_db.as_retriever(search_kwargs={"k": TOP_K})
+        docs = retriever.get_relevant_documents(user_question)
 
         chain = get_conversational_chain()
         if chain is None:
-            return
+            return ""
 
         response = chain(
             {"input_documents": docs, "question": user_question},
             return_only_outputs=True
         )
+        answer_text = response["output_text"]
         logger.info(f"Generated response for question: {user_question}")
         st.write("### Reply:")
-        st.success(response["output_text"])
+        st.success(answer_text)
+        return answer_text
     except Exception as e:
         logger.error(f"Error processing user input: {e}")
         st.error(f"Error processing user input: {e}")
+        return ""
 
 # Function to generate a downloadable report
 def generate_report(user_question, response_text):
@@ -150,6 +190,7 @@ def main():
 
     # Title and introduction
     st.markdown('<div class="main-title">Chat with PDF using Gemini</div>', unsafe_allow_html=True)
+    st.caption(f"Vector DB backend: {VECTOR_DB}")
     st.write("""
         Welcome to this interactive app that allows you to chat with your PDF documents using Google's Gemini model. 
         Upload your PDFs, ask questions, and get detailed answers extracted from the documents. This app leverages 
@@ -171,13 +212,17 @@ def main():
         user_question = st.text_input("Ask a Question from the PDF Files", key="user_question")
 
         if user_question:
-            if not os.path.exists("faiss_index"):
+            if VECTOR_DB == "CHROMA":
+                index_ready = os.path.isdir(PERSIST_DIR)
+            else:
+                index_ready = os.path.exists("faiss_index")
+            if not index_ready:
                 st.warning("Please upload and process PDF files before asking questions.")
             else:
-                response = user_input(user_question)
-                if response:
+                answer = user_input(user_question)
+                if answer:
                     # Offer downloadable report
-                    report_buffer = generate_report(user_question, response)
+                    report_buffer = generate_report(user_question, answer)
                     st.download_button(
                         label="Download Answer Report",
                         data=report_buffer,
@@ -211,18 +256,18 @@ def main():
         st.write("""
             This project demonstrates the power of modern NLP techniques for document-based question answering. 
             The app processes PDF documents, extracts text, splits it into chunks, creates embeddings using Google's 
-            Gemini model, and stores them in a FAISS vector store for efficient retrieval. Users can then ask questions, 
+            Gemini model, and stores them in a vector store (Chroma or FAISS) for efficient retrieval. Users can then ask questions, 
             and the app retrieves relevant document chunks to generate detailed answers.
 
             **Key Features:**
             - PDF text extraction and chunking.
             - Embedding generation using Google Gemini.
-            - Efficient similarity search using FAISS.
+            - Efficient similarity search using Chroma (persistent) or FAISS (local).
             - Conversational question answering with detailed responses.
             - Downloadable answer reports.
 
             **Technologies Used:**
-            - Python, Streamlit, PyPDF2, LangChain, Google Generative AI, FAISS, dotenv.
+            - Python, Streamlit, PyPDF2, LangChain, Google Generative AI, FAISS/Chroma, dotenv.
 
             **Developer:** Sai Ruthvik  
             This project is part of my portfolio to showcase my expertise in machine learning, natural language processing, 
