@@ -4,7 +4,6 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import google.generativeai as genai
-from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
@@ -12,6 +11,8 @@ from dotenv import load_dotenv
 import logging
 from io import BytesIO
 import base64
+from langchain.schema import Document
+from rag_utils import build_vectorstore, load_vectorstore, get_retriever, extract_documents_from_pdfs, split_documents
 
 # Set up logging for debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,7 +45,7 @@ def get_pdf_text(pdf_docs):
 def get_text_chunks(text):
     """Split text into chunks for processing."""
     try:
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
         chunks = text_splitter.split_text(text)
         logger.info(f"Text split into {len(chunks)} chunks")
         return chunks
@@ -54,12 +55,12 @@ def get_text_chunks(text):
         return []
 
 # Function to create and save vector store
-def get_vector_store(text_chunks):
-    """Create and save a FAISS vector store from text chunks."""
+def get_vector_store_from_documents(pdf_docs, prefer: str = "chroma"):
+    """Create and save a vector store by extracting documents from PDFs and splitting into chunks."""
     try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-        vector_store.save_local("faiss_index")
+        documents = extract_documents_from_pdfs(pdf_docs)
+        chunks = split_documents(documents, chunk_size=1500, chunk_overlap=200)
+        build_vectorstore(chunks, prefer=prefer)
         logger.info("Vector store created and saved successfully")
     except Exception as e:
         logger.error(f"Error creating vector store: {e}")
@@ -73,7 +74,6 @@ def get_conversational_chain():
     state "answer is not available in the context". Do not provide incorrect answers.\n\n
     Context:\n {context}\n
     Question: \n{question}\n
-
     Answer:
     """
     try:
@@ -88,27 +88,33 @@ def get_conversational_chain():
         return None
 
 # Function to handle user input and generate responses
-def user_input(user_question):
-    """Process user question and generate a response."""
+def user_input(user_question, k: int = 6, prefer: str = "chroma"):
+    """Process user question and generate a response using the configured vector DB."""
     try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-        docs = new_db.similarity_search(user_question)
+        vector_store = load_vectorstore(prefer=prefer)
+        if vector_store is None:
+            st.error("Vector store not found. Please upload and process PDF files first.")
+            return None
+        retriever = get_retriever(vector_store, k=k) or vector_store.as_retriever(search_kwargs={"k": k})
+        docs = retriever.get_relevant_documents(user_question)
 
         chain = get_conversational_chain()
         if chain is None:
-            return
+            return None
 
         response = chain(
             {"input_documents": docs, "question": user_question},
             return_only_outputs=True
         )
+        answer_text = response["output_text"]
         logger.info(f"Generated response for question: {user_question}")
         st.write("### Reply:")
-        st.success(response["output_text"])
+        st.success(answer_text)
+        return answer_text
     except Exception as e:
         logger.error(f"Error processing user input: {e}")
         st.error(f"Error processing user input: {e}")
+        return None
 
 # Function to generate a downloadable report
 def generate_report(user_question, response_text):
@@ -171,10 +177,14 @@ def main():
         user_question = st.text_input("Ask a Question from the PDF Files", key="user_question")
 
         if user_question:
-            if not os.path.exists("faiss_index"):
+            if not os.path.exists("chroma_db") and not os.path.exists("faiss_index"):
                 st.warning("Please upload and process PDF files before asking questions.")
             else:
-                response = user_input(user_question)
+                response = user_input(
+                    user_question,
+                    k=st.session_state.get("retriever_k", 6),
+                    prefer=st.session_state.get("vector_preference", "chroma"),
+                )
                 if response:
                     # Offer downloadable report
                     report_buffer = generate_report(user_question, response)
@@ -187,6 +197,21 @@ def main():
 
         with st.sidebar:
             st.title("Menu:")
+            vector_db_option = st.selectbox(
+                "Vector DB",
+                ["Auto (Chroma preferred)", "Chroma (persistent)", "FAISS (local)"]
+            )
+            prefer_map = {
+                "Auto (Chroma preferred)": "chroma",
+                "Chroma (persistent)": "chroma",
+                "FAISS (local)": "faiss",
+            }
+            prefer = prefer_map.get(vector_db_option, "chroma")
+            st.session_state["vector_preference"] = prefer
+
+            k = st.slider("Retriever k", min_value=3, max_value=12, value=6, step=1, key="retriever_k_slider")
+            st.session_state["retriever_k"] = k
+
             pdf_docs = st.file_uploader(
                 "Upload your PDF Files and Click on the Submit & Process Button",
                 accept_multiple_files=True,
@@ -196,12 +221,9 @@ def main():
                 if pdf_docs:
                     with st.spinner("Processing..."):
                         logger.info("Starting PDF processing...")
-                        raw_text = get_pdf_text(pdf_docs)
-                        if raw_text:
-                            text_chunks = get_text_chunks(raw_text)
-                            if text_chunks:
-                                get_vector_store(text_chunks)
-                                st.success("Done! You can now ask questions.")
+                        # Extract documents and split into chunks, then build the store
+                        get_vector_store_from_documents(pdf_docs, prefer=prefer)
+                        st.success("Done! You can now ask questions.")
                 else:
                     st.warning("Please upload at least one PDF file.")
 
@@ -211,18 +233,19 @@ def main():
         st.write("""
             This project demonstrates the power of modern NLP techniques for document-based question answering. 
             The app processes PDF documents, extracts text, splits it into chunks, creates embeddings using Google's 
-            Gemini model, and stores them in a FAISS vector store for efficient retrieval. Users can then ask questions, 
+            Gemini model, and stores them in a persistent vector store (Chroma when available, with FAISS fallback) for efficient retrieval. Users can then ask questions, 
             and the app retrieves relevant document chunks to generate detailed answers.
 
             **Key Features:**
             - PDF text extraction and chunking.
             - Embedding generation using Google Gemini.
-            - Efficient similarity search using FAISS.
+            - Persistent similarity search using Chroma (with FAISS fallback).
+            - MMR-based retriever for diverse, relevant context.
             - Conversational question answering with detailed responses.
             - Downloadable answer reports.
 
             **Technologies Used:**
-            - Python, Streamlit, PyPDF2, LangChain, Google Generative AI, FAISS, dotenv.
+            - Python, Streamlit, PyPDF2, LangChain, Google Generative AI, Chroma, FAISS, dotenv.
 
             **Developer:** Sai Ruthvik  
             This project is part of my portfolio to showcase my expertise in machine learning, natural language processing, 
